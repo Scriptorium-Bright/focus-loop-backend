@@ -1,254 +1,79 @@
-# Backend Engineering Portfolio Cases
+# Backend Engineer | FocusLoop
 
-실측 수치가 없는 항목은 임의로 만들지 않고 `측정 필요`로 표시한다.
+> 데이터가 깨지는 경쟁 조건과 처리량이 무너지는 자원 경계를 재현하고, 측정 가능한 구조로 바꾸는 백엔드 엔지니어입니다.
 
-## 1. 활성 상태 유일성을 partial unique index로 보장
+## 프로젝트 소개
 
-### 문제 정의
+FocusLoop는 작업 후보 수집부터 계획, 실행, 실패와 재시작 이력까지 서로 다른 생명주기로 관리하는 백엔드 프로젝트입니다. 기능 구현에 그치지 않고 대량 상태 전이의 JVM 메모리 비용, PostgreSQL transaction 범위, 동시 INSERT의 정합성, REST 쓰기 흐름의 포화 지점을 구현과 테스트로 검증했습니다.
 
-다중 트랜잭션에서 활성 세션 선행 조회가 동시에 통과하면 한 사용자에게 여러 실행 세션이 생겨 실행 시간과 실패 지표가 중복될 수 있었다.
+- 기술: Java 21, Spring Boot 3.3.8, Spring Batch, Spring Data JPA, PostgreSQL, Micrometer, k6
+- 상세 포트폴리오: [portfolio.md](portfolio.md)
+- 재현 방법과 전체 구조: [README.md](README.md)
 
-### 기술적 원인
+## 핵심 성과
 
-`exists -> insert` check-then-act와 미커밋 INSERT 가시성 한계 때문에 서비스 검증만으로 현재 상태 유일성을 보장할 수 없었다.
+- 512 MiB heap에서 JPA entity 순회 방식은 100,000건 처리 시 peak heap이 331.22 MiB 증가하고 GC가 32회 발생했습니다. set-based update 전환 후 10,000,000건을 OOM 없이 peak heap 증가 약 6 MiB·GC 0회로 처리했고, 현재 bounded 경로에서는 300,000건을 4,417ms에 처리했습니다.
+- 미커밋 INSERT를 볼 수 없고 잠글 기존 row도 없는 최초 생성 경쟁을 재현했습니다. 불변식의 형태에 따라 partial unique index, GiST exclusion constraint, parent row lock을 적용해 동시 요청 결과를 성공 1건·충돌 1건으로 수렴시켰습니다.
+- 5개의 REST write와 13개 row 생성을 하나의 업무 flow로 묶어 측정했습니다. 100 flow/s에서는 3,001 flow를 유실 없이 완료했고, 150 flow/s에서는 완료량이 130.37 flow/s에 머물며 384 iteration이 drop되는 포화 구간을 확인했습니다.
 
-### 해결 전략
+## 주요 문제 해결
 
-`status='STARTED'` row만 대상으로 사용자 partial unique index를 적용하고, constraint 충돌을 HTTP 409로 변환했다.
+### 1. 대량 상태 전이의 자원 비용에 상한을 만들었습니다
 
-### 의사결정
+기존 작업은 모든 만료 대상을 JPA entity로 읽어 영속성 컨텍스트에 유지했기 때문에, 처리량이 늘수록 heap과 dirty checking 대상도 함께 증가했습니다. 모든 row가 동일한 `OPEN → EXPIRED` 전이를 수행한다는 점에 주목해 PostgreSQL CTE와 `FOR UPDATE SKIP LOCKED` 기반 집합 연산으로 변경했습니다.
 
-전체 이력을 보존하면서 활성 row만 하나여야 하므로 `(user_id, status)` 일반 unique 대신 partial unique를 선택했다.
+변경 전 통제 하네스에서는 100,000건 처리에 9,647ms가 걸렸고 peak heap은 386.84 MiB, 실행 전 대비 증가는 331.22 MiB, GC는 32회·223ms였습니다. 첫 bulk update는 같은 512 MiB 제한에서 대상이 100배인 10,000,000건을 OOM 없이 처리했으며 peak heap 증가는 약 6 MiB, 추가 GC는 0회였습니다. 두 실험의 row 수가 달라 처리 시간 개선율은 계산하지 않았지만, 대상 수에 비례하던 JVM 객체·GC 비용을 제거했다는 근거로 사용했습니다.
 
-### 결과
+전체 변경을 한 transaction에 집중시키면 row lock, WAL, rollback 비용이 커지므로 최대 100,000건의 window마다 독립적으로 commit하도록 범위를 제한했습니다. Spring Batch는 성능 최적화 수단이 아니라 Job·Step의 실행 상태, 실패 전파, 처리 건수와 Micrometer 지표를 남기는 실행 틀로 사용했습니다. row별 변환이 없었기 때문에 Reader·Processor·Writer 대신 DB 집합 연산을 호출하는 Tasklet을 선택했습니다.
 
-동시 시작 2건에서 성공 1건, 충돌 1건, 최종 활성 세션 1건을 테스트로 확인했다. 처리량 수치: 측정 필요.
+### 2. 조회가 아니라 최종 커밋 상태를 기준으로 불변식을 설계했습니다
 
-### 남은 한계
+애플리케이션의 `exists → insert` 검증은 두 transaction이 동시에 `없음`을 읽는 경쟁을 막지 못했습니다. 특히 최초 시간 구간 INSERT는 `SELECT FOR UPDATE`를 사용해도 잠글 tuple이 없었습니다. 두 요청이 모두 검증을 통과한 시점에 barrier를 두어 이 경쟁을 결정적으로 재현했습니다.
 
-명령 수준 idempotency key는 없어 timeout 이후 재시도와 별도 충돌을 구분하지 못한다.
+현재 상태의 equality에는 과거 이력을 보존하는 partial unique index를, 시간 범위 교차에는 `tstzrange` 기반 GiST exclusion constraint를 적용했습니다. 부모별 child 최대 개수처럼 단일 DB 제약으로 표현하기 어려운 규칙은 항상 존재하는 parent row를 잠근 뒤 count와 INSERT를 직렬화했습니다. 하나의 lock을 반복 적용하지 않고, 불변식의 모양과 최소 직렬화 지점을 기준으로 방어 계층을 선택했습니다.
 
-### 면접 방어 질문
+## 측정과 판단 기준
 
-- unique conflict를 재시도할지 즉시 409로 반환할지?
-- 기존 중복 데이터가 있는 운영 DB에 index를 어떻게 배포할지?
+- 평균 응답 시간이나 HTTP 성공률만으로 용량을 판단하지 않고, offered load와 completed throughput, p95·p99, dropped work를 함께 봤습니다.
+- 변경 전 100,000건과 첫 bulk 10,000,000건은 대상 수가 달라 처리 시간 개선율을 계산하지 않았습니다. 대신 같은 heap 제한에서 100배 규모를 더 낮은 peak heap과 GC 0회로 처리한 메모리·확장성 개선을 명시했습니다.
+- 100,000건 transaction window는 현재 설정이며 최적값으로 주장하지 않습니다.
+- 300,000건 수치는 Spring Batch 전체 경로가 아닌 `service → native SQL` 하네스의 단일 로컬 실행 결과입니다. Batch lifecycle과 실패 전파는 별도의 통합 테스트로 검증했습니다.
+- 로컬 30초 부하 결과를 운영 SLA로 일반화하지 않고, 안정 구간과 포화가 시작되는 조건을 구분하는 근거로 사용했습니다.
 
-## 2. 삭제 이력과 현재 배치 유일성을 분리
+## 제가 보여드릴 수 있는 역량
 
-### 문제 정의
+- JVM 객체 생명주기와 ORM 영속성 컨텍스트를 고려한 대량 처리 설계
+- PostgreSQL MVCC, row lock, unique·range constraint를 활용한 동시성 제어
+- transaction 범위, 재실행 의미, 정합성 규칙을 함께 고려하는 실패 설계
+- 가설을 경쟁 테스트와 부하 테스트로 재현하고, 수치가 말할 수 있는 범위를 제한하는 검증 방식
 
-보드 entry 교체 이력을 보존하면서 활성 slot과 활성 item 중복은 막아야 했다.
+## 상세 자료
 
-### 기술적 원인
+- [11페이지 기술 포트폴리오](portfolio.md)
+- [대량 상태 전이 상세 문서](docs/case-studies/01_BULK_STATE_TRANSITION.md)
+- [동시성 불변식 상세 문서](docs/case-studies/02_PLANNING_CONCURRENCY_INVARIANTS.md)
+- [처리량 실험 결과](perf/results/core-throughput/README.md)
 
-물리 삭제는 이력을 잃고, 전체 unique는 과거 removed row 때문에 정상 재배치를 막는다.
+## 프론트엔드 이력서 후보
 
-### 해결 전략
+문제: 장시간 켜두는 집중 장면에서 연속 파도선 반복, 상시 노출 UI, 짧은 오디오 루프가 시각·청각 피로를 만들 수 있었습니다.
 
-`removed_at`으로 이력을 남기고 `removed_at is null` 조건의 slot/item partial unique index 두 개로 현재 상태만 제약했다.
+해결: Web Canvas와 Native SVG에 결정론적 dash/gap 패턴을 공유하고, Focus UI를 4.8초 후 자동 숨김·탭 재노출 구조로 바꾸었으며, Web Audio brown-noise 버퍼를 16초와 양끝 완화 방식으로 확장했습니다.
 
-### 의사결정
+결과: 단위 테스트 19건 통과, Web build/typecheck 통과, Chrome에서 Home/Focus·30초 영상·progress 0/0.5/1·Pause·Reduce Motion·mobile A/B evidence를 확보했습니다. Native 실기기 frame time·배터리·발열은 측정 필요.
 
-상태 컬럼 덮어쓰기나 hard delete 대신 temporal history와 current invariant를 schema에서 분리했다.
+## FocusLoop Web 구현 기록
 
-### 결과
+문제:
+UX 설계 문서의 세션 상태, 15초 항구 탐색, 휴식·복귀, Logbook, 스킨 접근 조건을 브라우저에서 같은 흐름으로 동작시켜야 했습니다.
 
-동시 교체에서도 active slot/item 중복이 커밋되지 않음을 PostgreSQL 테스트로 확인했다. 처리량 수치: 측정 필요.
+해결:
+React + TypeScript + Vite로 화면을 구성하고, 세션 전이를 reducer로 분리했습니다. Focus·Rest 시간은 `Date.now()`와 timestamp로 계산하고, Canvas Scene은 상태·스킨·Reduce Motion을 입력으로 받도록 분리했습니다. localStorage에 세션·작업·여정·Logbook을 저장하고, 상태 전이 즉시 저장과 15초 snapshot을 적용했습니다.
+Logbook 삭제·JSON/CSV/이미지 Export·일간/주간/긴 여정 View, Journey Detail·Session Recovery, Quick 작업 승격 제안과 스킨별 Sound Preview를 local-first 경계 안에 추가했습니다.
+MVP 이후에는 Session/Logbook 이벤트를 멱등 Sync Queue에 저장하고 실패 시 backoff를 적용했습니다. 작업명 원문을 analytics와 sync payload에서 제외하고, Premium 권한은 만료 시각이 있는 Entitlement Cache로만 적용하도록 했습니다. PWA shell, 결제/복원 Adapter, 장면 FPS 진단도 같은 경계에 연결했습니다.
 
-### 남은 한계
+의사결정:
+애니메이션 tick을 시간 기준으로 사용하지 않았습니다. Pause·Resume·Arrival을 명시적 전이로 두고, 중복 START는 reducer에서 차단했습니다. Premium/Unlock 스킨은 미리보기와 적용 조건을 분리했습니다. 외부 서버·결제 SDK가 없는 환경에서 성공을 가장하지 않고, Adapter와 로컬 캐시만 동작하도록 했습니다.
 
-같은 사용자·주차·원본 inbox의 Big3Item 자연키 unique는 별도 과제로 남아 있다.
-
-### 면접 방어 질문
-
-- partial index predicate와 실제 조회 predicate가 일치하는가?
-- removed history 증가에 따른 index/table 크기는 어떻게 관리할 것인가?
-
-## 3. 시간 범위 불변식을 exclusion constraint로 방어
-
-### 문제 정의
-
-겹치는 기존 row가 없을 때 `SELECT FOR UPDATE`는 잠글 대상이 없어 동시 timebox INSERT를 막지 못한다.
-
-### 기술적 원인
-
-시간 범위 overlap은 단순 equality unique로 표현할 수 없고, 애플리케이션 overlap 검사는 phantom insert 경쟁에 취약하다.
-
-### 해결 전략
-
-유효 구간 check와 PostgreSQL `tstzrange` GiST exclusion constraint를 적용해 PLANNED 시간 구간의 교차를 schema에서 거절했다.
-
-### 의사결정
-
-사용자별 guard row 직렬화보다 DB range invariant가 모든 쓰기 경로를 보호하고 다른 사용자의 병렬성을 유지한다.
-
-### 결과
-
-동시 최초 INSERT 경쟁에서도 최종 겹치는 timebox가 하나만 남도록 검증했다. 성능 수치: 측정 필요.
-
-### 남은 한계
-
-GiST index 크기, write amplification, 충돌률별 지연을 측정하지 않았다.
-
-### 면접 방어 질문
-
-- `[)` 경계로 인접 구간을 허용한 이유는?
-- cancellation과 constraint predicate가 같은 상태 정의를 사용하는가?
-
-## 4. Carryover lineage 1:1 불변식
-
-### 문제 정의
-
-동일한 이전 작업에서 여러 후속 작업이 만들어지면 실행 이력과 주간 집계 identity가 분산된다.
-
-### 기술적 원인
-
-두 트랜잭션이 `existsByDerivedFromItem_Id=false`를 함께 읽고 insert하는 write skew가 가능했다.
-
-### 해결 전략
-
-nullable `derived_from_item_id`에 partial unique를 적용하고 알려진 충돌을 HTTP 409로 변환했다.
-
-### 의사결정
-
-source row lock보다 DB unique를 최종 방어선으로 선택해 모든 쓰기 경로에 lineage 1:1을 강제했다.
-
-### 결과
-
-동시 요청에서 성공 1건, 제약 실패 1건, 최종 후속 item 1건을 확인했다. 성능 수치: 측정 필요.
-
-### 남은 한계
-
-versioned migration과 기존 중복 cleanup runbook이 필요하다.
-
-### 면접 방어 질문
-
-- `NULL`을 허용하면서 1:1을 어떻게 표현했는가?
-- unique 위반을 멱등 성공으로 반환하지 않고 409로 둔 이유는?
-
-## 5. Aggregate 최대 child 수의 동시성 제어
-
-### 문제 정의
-
-ExecutionUnit 4개 상태에서 동시 생성 두 건이 모두 검증을 통과하면 최대 5개 규칙이 깨진다.
-
-### 기술적 원인
-
-부모별 최대 N개는 단일 child unique로 표현하기 어렵고, count와 insert가 같은 직렬화 경계에 없었다.
-
-### 해결 전략
-
-부모 row를 `PESSIMISTIC_WRITE`로 잠근 후 child count 검증과 insert를 수행했다.
-
-### 의사결정
-
-별도 counter row의 상태 중복과 optimistic retry 복잡도를 피하고, 짧고 낮은 빈도의 임계 구역에 parent lock을 사용했다.
-
-### 결과
-
-동시 생성 결과가 성공 1건, 실패 1건, 최종 child 5개로 수렴했다. lock wait/throughput: 측정 필요.
-
-### 남은 한계
-
-lock timeout 오류 정책과 hot-key 경합 측정이 없다.
-
-### 면접 방어 질문
-
-- 왜 DB trigger나 counter table을 선택하지 않았는가?
-- deadlock 방지를 위한 lock order는 무엇인가?
-
-## 6. 대량 상태 전이의 ORM 메모리 병목 제거
-
-### 문제 정의
-
-주간 만료 대상 전체를 entity로 로딩하면 persistence context가 커져 heap과 dirty checking 비용이 증가한다.
-
-### 기술적 원인
-
-row-by-row entity materialization이 대상 수에 비례해 애플리케이션 메모리와 flush 비용을 사용한다.
-
-### 해결 전략
-
-`FOR UPDATE SKIP LOCKED` 대상 CTE와 set-based update를 bounded chunk transaction으로 반복하고 version도 함께 증가시켰다.
-
-### 의사결정
-
-전체 단일 update는 lock/WAL burst가 크고 entity 순회는 heap을 사용하므로, chunk 단위 DB update로 두 위험을 절충했다.
-
-### 결과
-
-로컬 PostgreSQL 14.21, JVM max heap 512 MiB에서 300,000건을 4,417ms(67,919 rows/s)에 전이했다. peak heap 증가는 3.00 MiB였고 GC는 0회였다.
-
-### 남은 한계
-
-현재 chunk size 100,000의 산정 근거와 다중 instance scheduler 정책이 충분하지 않다.
-
-### 면접 방어 질문
-
-- chunk size를 어떤 지표로 조정할 것인가?
-- 장애 시 이미 처리한 chunk를 어떻게 재실행 안전하게 판별하는가?
-
-## 7. 실행 lifecycle과 이벤트 이력 분리
-
-### 문제 정의
-
-세션 상태, 실패 원인, 재시작 사실을 한 row에 덮어쓰면 상태 전이 이력과 분석 grain이 섞인다.
-
-### 기술적 원인
-
-현재 상태와 사건 기록은 변경 빈도·유일성·조회 목적이 다르다.
-
-### 해결 전략
-
-`RecoverySession`, `FailureEvent`, `RestartEvent`를 분리하고 session은 versioned 상태 전이, event는 append 중심 기록으로 구성했다.
-
-### 의사결정
-
-도메인 이벤트 인프라를 새로 도입하지 않고 관계형 테이블 grain을 분리해 현재 프로젝트 규모에서 추적 가능성을 확보했다.
-
-### 결과
-
-완료·중단·실패 체크인·재시작의 정상/충돌 흐름을 service/controller 테스트로 고정했다. 운영 복구 시간: 측정 필요.
-
-### 남은 한계
-
-failure check-in idempotency와 session terminal 경쟁의 API taxonomy가 남아 있다.
-
-### 면접 방어 질문
-
-- append-only event와 mutable session의 트랜잭션 경계는 어디인가?
-- failure 저장이 실패하면 session interrupt도 롤백되는가?
-
-## 8. Core write flow 처리량과 포화 지점 측정
-
-### 문제 정의
-
-개별 API가 빠른지만으로는 Inbox→Planning→ExecutionUnit 전체 command 흐름의 안정 처리량과 tail latency를 설명할 수 없었다.
-
-### 기술적 원인
-
-하나의 사용자 flow가 5개 HTTP write, 여러 transaction, 13개 row 생성을 포함하므로 connection pool과 DB write 지연이 누적된다.
-
-### 해결 전략
-
-k6 constant-arrival-rate로 40/100/150 flow/s를 각각 30초 측정하고, 성공률뿐 아니라 completed throughput, dropped iteration, flow p95/p99, 최종 DB row 비율을 검증했다.
-
-### 의사결정
-
-단일 endpoint benchmark 대신 실제 도메인 전이 순서와 parent-child 생성을 포함한 flow benchmark를 선택했다. offered load와 completed throughput을 분리해 queueing 포화를 숨기지 않았다.
-
-### 결과
-
-- 100 flow/s: 3,001 flow, 99.89 flow/s, 성공률 100%, p95 535ms, p99 765ms
-- 150 flow/s: 130.37 flow/s, p95 2.73초, dropped iteration 384, max 300 VU 도달
-- 완료 flow 모두 `board 1 : inbox 3 : Big3Item 3 : ExecutionUnit 6` 최종 상태 유지
-
-### 남은 한계
-
-부하 발생기·API·DB가 같은 로컬 머신이며 30초 window다. 운영 SLA로 일반화하려면 분리된 부하 발생기와 장시간 soak test가 필요하다.
-
-### 면접 방어 질문
-
-- 성공률 100%인데 왜 150 flow/s를 실패 구간으로 보는가?
-- arrival rate와 completion rate 차이는 무엇을 의미하는가?
-- Hikari pool 17과 tail latency 관계를 어떻게 추가 검증할 것인가?
+결과:
+Home → Focus → Pause → Harbor Search → Rest → Resume → Arrival → Logbook 흐름과 Journey/Skin 화면을 브라우저에서 확인했습니다. `frontend` 테스트 25개와 `npm run build`를 통과했고, 320×568·desktop Home 및 PWA asset 생성을 확인했습니다. 실제 Cloud Sync endpoint·인증, 결제 SDK/영수증 검증, iOS/Android 실기기와 25분 사용자 테스트는 별도 검증 항목입니다.

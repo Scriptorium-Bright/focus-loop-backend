@@ -11,7 +11,12 @@ execution  실제 실행 시도·실패·재시작 도메인
 common     세 도메인을 지원하는 기술 계층
 ```
 
-analytics, friction, retrospective, 별도 ops API, 프론트엔드, Airflow orchestration은 제거했습니다.
+백엔드 프로젝트 범위에서는 analytics, friction, retrospective, 별도 ops API,
+Airflow orchestration을 제거했습니다.
+
+단, 집중 장면과 세션 흐름을 검증하기 위한 Expo web/mobile MVP는 백엔드 모듈과 분리된
+`frontend/` 디렉터리에 둡니다. 실행 방법과 렌더링·검증 범위는
+[`frontend/README.md`](frontend/README.md)에 기록합니다.
 
 ## Domain Model
 
@@ -43,6 +48,7 @@ RecoverySession
 
 - aggregate/root: `DailyBig3Board`, `Big3Item`, `ExecutionUnit`, `Timebox`
 - history: `DailyBig3Entry.removedAt`
+- batch: Spring Batch `big3ExpirationBatchJob`
 - 핵심 불변식
   - 사용자·날짜별 보드 하나
   - 활성 slot/item 중복 금지
@@ -82,7 +88,7 @@ planning은 execution repository를 직접 참조하지 않습니다. `ActiveSes
 - timebox period: check + GiST exclusion constraint
 - ExecutionUnit 최대 개수: parent row `PESSIMISTIC_WRITE`
 - lifecycle 경쟁: JPA `@Version`
-- 대량 만료: `FOR UPDATE SKIP LOCKED` + bounded set-based update
+- 대량 만료: Spring Batch Tasklet + `FOR UPDATE SKIP LOCKED` + bounded set-based update
 
 ## Measured Throughput
 
@@ -117,13 +123,22 @@ planning은 execution repository를 직접 참조하지 않습니다. `ActiveSes
   - `POST /api/v1/recovery/inbox-items`
 - Planning
   - `POST /api/v1/recovery/big3`
-  - `GET /api/v1/recovery/big3/today`
+  - `GET /api/v1/recovery/big3?userId=...`
+  - `POST /api/v1/recovery/continue`
+  - `POST /api/v1/recovery/abandon`
   - `POST /api/v1/recovery/execution-units`
   - `POST /api/v1/recovery/execution-units/multiple`
+  - `GET /api/v1/recovery/execution-units?userId=...&big3ItemId=...`
+  - `PATCH /api/v1/recovery/execution-units/{executionUnitId}`
+  - `POST /api/v1/recovery/execution-units/{executionUnitId}/complete`
   - `POST /api/v1/recovery/timeboxes`
+  - `POST /api/v1/recovery/cancelled`
 - Execution
   - `POST /api/v1/recovery/sessions/start`
   - `POST /api/v1/recovery/sessions/complete`
+  - `POST /api/v1/recovery/sessions/elapsed`
+  - `POST /api/v1/recovery/sessions/interrupt`
+  - `POST /api/v1/recovery/sessions/stopped`
   - `POST /api/v1/recovery/failures/check-in`
   - `POST /api/v1/recovery/restarts`
 

@@ -3,6 +3,9 @@ spring:
     name: rebootfocus-api
   profiles:
     default: local
+  batch:
+    job:
+      enabled: false
   jpa:
     open-in-view: false
 

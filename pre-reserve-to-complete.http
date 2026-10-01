@@ -1,0 +1,156 @@
+### FocusLoop end-to-end debug flow
+#
+# 현재 체크아웃에는 ImTicket의 /api/reservation/pre-reserve 엔드포인트가 없으므로,
+# 이 파일은 현재 FocusLoop에서 실행 가능한 동일 흐름을 따라간다.
+#
+# Inbox 후보 저장
+#   -> 오늘의 Big3 선택
+#   -> ExecutionUnit 생성
+#   -> WORK Timebox 선점/배정
+#   -> RecoverySession 시작
+#   -> RecoverySession 완료
+#
+# IntelliJ HTTP Client 기준:
+# 1. 아래 @userId를 매 실행마다 새 값으로 바꾼다.
+# 2. 요청을 위에서부터 순서대로 실행한다.
+# 3. 각 응답 handler가 다음 요청에 필요한 ID를 자동 저장한다.
+
+@baseUrl = http://localhost:10080
+@userId = http-debug-20260813-01
+
+### 1. PRE-RESERVE equivalent: Inbox 후보 저장
+POST {{baseUrl}}/api/v1/recovery/inbox-items
+Content-Type: application/json
+X-Debug-Flow: pre-reserve-to-complete
+
+{
+  "userId": "{{userId}}",
+  "items": [
+    {
+      "content": "예매 후보 1 - 좌석 선택 흐름 확인"
+    },
+    {
+      "content": "예매 후보 2 - 결제 전 상태 확인"
+    },
+    {
+      "content": "예매 후보 3 - 완료 후 이력 확인"
+    }
+  ]
+}
+
+> {%
+const body = response.body;
+client.global.set("inboxItemId1", body.data.savedItems[0].id);
+client.global.set("inboxItemId2", body.data.savedItems[1].id);
+client.global.set("inboxItemId3", body.data.savedItems[2].id);
+%}
+
+### 2. Big3 선택
+POST {{baseUrl}}/api/v1/recovery/big3
+Content-Type: application/json
+X-Debug-Flow: pre-reserve-to-complete
+
+{
+  "userId": "{{userId}}",
+  "itemIds": [
+    "{{inboxItemId1}}",
+    "{{inboxItemId2}}",
+    "{{inboxItemId3}}"
+  ]
+}
+
+> {%
+const body = response.body;
+client.global.set("big3ItemId", body.data.selectedItems[0].big3ItemId);
+%}
+
+### 3. Big3 확인
+GET {{baseUrl}}/api/v1/recovery/big3?userId={{userId}}
+X-Debug-Flow: pre-reserve-to-complete
+
+### 4. Big3에 실행 단위 생성
+POST {{baseUrl}}/api/v1/recovery/execution-units
+Content-Type: application/json
+X-Debug-Flow: pre-reserve-to-complete
+
+{
+  "userId": "{{userId}}",
+  "big3ItemId": "{{big3ItemId}}",
+  "title": "예매 완료 상태 전이 확인"
+}
+
+> {%
+const body = response.body;
+client.global.set("executionUnitId", body.data.executionUnitId);
+%}
+
+### 5. ExecutionUnit 확인
+GET {{baseUrl}}/api/v1/recovery/execution-units?userId={{userId}}&big3ItemId={{big3ItemId}}
+X-Debug-Flow: pre-reserve-to-complete
+
+### 6. WORK Timebox 배정
+# startAt/endAt은 현재 시각과 무관하게 OffsetDateTime 형식이면 된다.
+# firstRecoveryBlock=true인 WORK 블록이 요청에 정확히 하나 있어야 한다.
+POST {{baseUrl}}/api/v1/recovery/timeboxes
+Content-Type: application/json
+X-Debug-Flow: pre-reserve-to-complete
+
+{
+  "userId": "{{userId}}",
+  "timeboxes": [
+    {
+      "executionUnitId": "{{executionUnitId}}",
+      "startAt": "2030-01-01T09:00:00+09:00",
+      "endAt": "2030-01-01T09:30:00+09:00",
+      "firstRecoveryBlock": true,
+      "type": "WORK"
+    }
+  ]
+}
+
+> {%
+const body = response.body;
+client.global.set("timeboxId", body.data.timeboxes[0].timeboxId);
+%}
+
+### 7. PRE-RESERVE 결과 확인
+GET {{baseUrl}}/api/v1/recovery/execution-units?userId={{userId}}&big3ItemId={{big3ItemId}}
+X-Debug-Flow: pre-reserve-to-complete
+
+### 8. 예매/실행 시작에 해당하는 Session 시작
+POST {{baseUrl}}/api/v1/recovery/sessions/start
+Content-Type: application/json
+X-Debug-Flow: pre-reserve-to-complete
+
+{
+  "userId": "{{userId}}",
+  "timeboxId": "{{timeboxId}}"
+}
+
+> {%
+const body = response.body;
+client.global.set("sessionId", body.data.sessionId);
+%}
+
+### 9. 예매 완료에 해당하는 Session 완료
+POST {{baseUrl}}/api/v1/recovery/sessions/complete
+Content-Type: application/json
+X-Debug-Flow: pre-reserve-to-complete
+
+{
+  "userId": "{{userId}}",
+  "sessionId": "{{sessionId}}"
+}
+
+### 10. 실행 단위까지 완료 처리하고 최종 상태 확인
+POST {{baseUrl}}/api/v1/recovery/execution-units/{{executionUnitId}}/complete
+Content-Type: application/json
+X-Debug-Flow: pre-reserve-to-complete
+
+{
+  "userId": "{{userId}}"
+}
+
+### 11. 최종 Big3 상태 확인
+GET {{baseUrl}}/api/v1/recovery/big3?userId={{userId}}
+X-Debug-Flow: pre-reserve-to-complete

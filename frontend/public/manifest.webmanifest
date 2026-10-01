@@ -1,0 +1,11 @@
+{
+  "name": "FocusLoop",
+  "short_name": "FocusLoop",
+  "description": "조용한 항해로 이어가는 집중 시간",
+  "lang": "ko",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0a1822",
+  "theme_color": "#0d1e2c"
+}
